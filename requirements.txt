@@ -1,0 +1,11 @@
+numpy
+pandas
+requests
+beautifulsoup4
+python-dateutil
+pybaseball
+tqdm
+lxml
+scikit-learn
+xgboost
+lightgbm
