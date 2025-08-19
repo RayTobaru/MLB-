@@ -19,7 +19,6 @@ nba_model/
 ├── precompute.py # Builds pitcher/batter profiles & probability models
 ├── data_fetch.py              # API and web scraping logic
 ├── gameday_sim.py # CLI driver – run simulations and print reports
-├── data/ # Sample input CSVs (starters, lineups, batter rates, lookup)
 ├── requirements.txt # Python dependencies
 ├── LICENSE # MIT license
 └── README.md # Project documentation
