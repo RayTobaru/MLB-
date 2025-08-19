@@ -32,3 +32,21 @@ fetch.py ──► precompute.py ──► gameday_sim.py ──► Outputs
 │ └── Builds pitcher & batter probability profiles
 └── Loads CSV data (or sample), stubs for ETL
 ```
+## Example Outputs 
+[FDodds.csv](https://github.com/user-attachments/files/21846368/FDodds.csv)
+Utilize Sportsbook odds to a csv file to create baseline modeling 
+<img width="167" height="744" alt="image" src="https://github.com/user-attachments/assets/46a8e5fc-4aad-4e16-b368-c586219d6806" />
+
+Select Today's Matchup
+<img width="1314" height="291" alt="image" src="https://github.com/user-attachments/assets/dde6ee08-855e-4e79-b432-b9167e9f2b7c" />
+
+Simulate and creates 
+Prints starter KO tables & batter props
+Builds pitcher & batter probability profiles
+Loads CSV data (or sample), stubs for ETL 
+<img width="1483" height="447" alt="image" src="https://github.com/user-attachments/assets/192806e6-298c-4797-8fe3-d36b182ecece" />
+
+
+
+
+
