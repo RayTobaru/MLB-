@@ -1,8 +1,30 @@
 # MLB Simulator
 
-An end-to-end Python project to fetch MLB data, build advanced player profiles, and run Monte Carlo simulations for game outcomes and player props.
+An end-to-end Python project to simulate MLB matchups.  
+It fetches/cleans data, builds pitcher and batter profiles, and runs probability models (Poisson + Monte Carlo-style) to generate game-day insights such as strikeout distributions and batting prop probabilities.
 
-![CI](https://github.com/RayTobaru/MLB/actions/workflows/python-app.yml/badge.svg)
+---
 
-## 📂 Repository Structure
+## Features
+- **Data layer (ETL-ready):** Loads CSVs from `data/` (sample files included). Stubs provided for Statcast/FanGraphs/MLB.com scrapers.
+- **Modeling:** 
+  - Pitcher strikeout projections (Poisson tails from K/9 + IP/start)  
+  - Batter hit/HR probabilities from per-PA rates  
+- **Outputs:** Starter KO probability tables, Batter prop tables (P(Hits≥1), P(HR≥1), etc.)
+- **Extensible:** Easy to plug in park factors, bullpen logic, and advanced regression models.
+
+---
+
+## Repository Structure
+├── fetch.py # Data layer: loads CSVs (or sample data), ETL stubs
+├── precompute.py # Builds pitcher/batter profiles & probability models
+├── gameday_sim.py # CLI driver – run simulations and print reports
+├── data/ # Sample input CSVs (starters, lineups, batter rates, lookup)
+├── requirements.txt # Python dependencies
+├── LICENSE # MIT license
+└── README.md # Project documentation
+
+
+
+---
 
