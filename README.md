@@ -13,19 +13,14 @@ It fetches/cleans data, builds pitcher and batter profiles, and runs probability
 - **Outputs:** Starter KO probability tables, Batter prop tables (P(Hits≥1), P(HR≥1), etc.)
 - **Extensible:** Easy to plug in park factors, bullpen logic, and advanced regression models.
 
----
-
-## Repository Structure
-.
+```
+nba_model/
 ├── fetch.py # Data layer: loads CSVs (or sample data), ETL stubs
 ├── precompute.py # Builds pitcher/batter profiles & probability models
+├── data_fetch.py              # API and web scraping logic
 ├── gameday_sim.py # CLI driver – run simulations and print reports
 ├── data/ # Sample input CSVs (starters, lineups, batter rates, lookup)
 ├── requirements.txt # Python dependencies
 ├── LICENSE # MIT license
 └── README.md # Project documentation
-
-
-
----
-
+```
