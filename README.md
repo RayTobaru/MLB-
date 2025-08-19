@@ -25,8 +25,10 @@ nba_model/
 ```
 
 ## Pipeline Flow
+```
 fetch.py ──► precompute.py ──► gameday_sim.py ──► Outputs
 │ │ │
 │ │ └── Prints starter KO tables & batter props
 │ └── Builds pitcher & batter probability profiles
 └── Loads CSV data (or sample), stubs for ETL
+```
