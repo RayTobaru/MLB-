@@ -16,6 +16,7 @@ It fetches/cleans data, builds pitcher and batter profiles, and runs probability
 ---
 
 ## Repository Structure
+.
 ├── fetch.py # Data layer: loads CSVs (or sample data), ETL stubs
 ├── precompute.py # Builds pitcher/batter profiles & probability models
 ├── gameday_sim.py # CLI driver – run simulations and print reports
