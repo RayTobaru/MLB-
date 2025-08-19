@@ -26,7 +26,9 @@ from precompute_everything import (
     features_base, league_feature_means, predict_hr_proba, IP_REG, sample_starter_ip,
     predict_hr_count_pt, predict_hr_hardhit, predict_hr_2swhiff, predict_hr_pullangle,
     iso_pa_calibrators, expected_matchup_xiso,
-    hr_game_cals, HR_LAMBDA_SCALE, infer_hr_archetype, sp_pa_share
+    hr_game_cals, HR_LAMBDA_SCALE, infer_hr_archetype, sp_pa_share,
+    get_recent_evt_feats, batter_recent_multiplier,
+    get_pitcher_recent, pitcher_recent_multiplier
 )
 
 pd.set_option("display.expand_frame_repr", False)
@@ -504,6 +506,10 @@ def main():
             ])
             p_hr = 0.75*p_stack + 0.25*p_sub
 
+            # recent-event multipliers (yesterday HR, 7d contact quality)
+            evt = get_recent_evt_feats(bat_id)
+            p_hr *= batter_recent_multiplier(evt)
+
             # recent barrels + ISO bump
             b14 = scb.get("barrel_14d_pct", np.nan)
             if np.isfinite(b14):
@@ -540,8 +546,12 @@ def main():
 
             # --- SP vs BP blend (preserve batter skill)
             sp_share   = sp_pa_share(opp_st.get("Pitcher_ID"))
-            p_pa_vs_sp = p_hr * _pitcher_hr_mult(opp_st) * env_mult
+            pit_rec    = get_pitcher_recent(opp_st.get("Pitcher_ID") or 0)
+            pit_recent_mult = pitcher_recent_multiplier(pit_rec, LEAGUE_HR_PER_PA)
+
+            p_pa_vs_sp = p_hr * _pitcher_hr_mult(opp_st) * pit_recent_mult * env_mult
             p_pa_vs_bp = p_hr * bp_mult * env_mult
+
             p_pa_final = sp_share * p_pa_vs_sp + (1.0 - sp_share) * p_pa_vs_bp
             p_pa_final = float(np.clip(p_pa_final, 0.003, 0.40))
 
@@ -660,25 +670,34 @@ def main():
                 print(f"[auto α] learned={alpha_auto:.2f} (smoothed)")
 
     # ---- optional market remap (with history) ----
+    # ---- optional market remap (with history) ----
     if mk:
+        # today-only pairs (before adding history)
+        pairs_today = []
         x_model, y_book = [], []
         for r in batter_rows:
             nm_norm = clean_name(strip_pos(r["Name"]))
             if nm_norm in mk:
-                x_model.append(r["P(HR≥1)"]); y_book.append(mk[nm_norm])
-        # add memory
+                model_p = r["P(HR≥1)"]
+                book_p  = mk[nm_norm]
+                x_model.append(model_p); y_book.append(book_p)
+                pairs_today.append((model_p, book_p))
+
+        # add memory to the fit
         hist = _load_market_history()
         if hist:
             hx, hy = zip(*hist)
             x_model = list(x_model) + list(hx)
             y_book  = list(y_book)  + list(hy)
+
         f = fit_market_calibrator(x_model, y_book)
         if f:
             for r in batter_rows:
                 pm = f(r["P(HR≥1)"])
                 r["P(HR≥1)"] = _cap_move(r["P(HR≥1)"], pm, rel_cap=0.20)
-        # log today (without history)
-        _append_market_log(list(zip(x_model[:len(y_book)], y_book[:len(x_model)])), use_date)
+
+        # persist only today’s pairs
+        _append_market_log(pairs_today, use_date)
 
     # fill rare gaps
     def league_rate_dict():
