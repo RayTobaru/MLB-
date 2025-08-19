@@ -37,6 +37,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.base import clone
 import xgboost as xgb
 import lightgbm as lgb
+import math
 
 from fetch import (
     ID2ABBR, YEAR,
@@ -125,6 +126,10 @@ def parquet_cache_df(key_fmt: str):
         return wrapped
     return deco
 
+def _nz_df(df):
+    """Return df if it's a non-empty DataFrame, else an empty DataFrame."""
+    return df if (isinstance(df, pd.DataFrame) and not df.empty) else pd.DataFrame()
+
 def expected_sp_ip_simple(starter_pid: int) -> float:
     """
     Very stable SP IP expectation using season IP/GS with a small pull to league.
@@ -153,6 +158,171 @@ def sp_pa_share(starter_pid: int) -> float:
     """
     m = expected_sp_ip_simple(starter_pid)
     return float(np.clip(m / 9.0, 0.15, 0.95))
+
+@disk_cache("recent_evt_feats.pkl")
+def build_recent_event_features(days_short:int=1, days_med:int=7):
+    """
+    Returns {batter_pid: {hr_1d, pa_1d, hr_7d, pa_7d, bbe95_7d, pulled_fly_7d, xwobacon_7d}}
+    pulled_fly_7d ≈ pulled + airborne (using bb_type + coarse spray proxy).
+    """
+    end = datetime.today()
+    s1  = (end - timedelta(days=days_short)).strftime("%Y-%m-%d")
+    s7  = (end - timedelta(days=days_med)).strftime("%Y-%m-%d")
+    e   = end.strftime("%Y-%m-%d")
+
+    # yesterday (or last 1d window)
+    d1 = _nz_df(fetch_statcast_raw(s1, e))
+    d7 = _nz_df(fetch_statcast_raw(s7, e))
+
+    out = {}
+    # --- 1d ---
+    if not d1.empty:
+        d1["is_pa"] = d1["events"].notna().astype(int)
+        g1 = d1.groupby("batter")
+        hr1 = g1["events"].apply(lambda s: (s=="home_run").sum()).rename("hr_1d")
+        pa1 = g1["is_pa"].sum().rename("pa_1d")
+        df1 = pd.concat([hr1, pa1], axis=1).reset_index()
+    else:
+        df1 = pd.DataFrame(columns=["batter","hr_1d","pa_1d"])
+
+    # --- 7d ---
+    if not d7.empty:
+        d7 = d7.copy()
+        d7["is_pa"] = d7["events"].notna().astype(int)
+        d7 = d7.replace([np.inf,-np.inf], np.nan)
+        # ensure numeric
+        for c in ("launch_speed","launch_angle"):
+            if c in d7.columns:
+                d7[c] = pd.to_numeric(d7[c], errors="coerce")
+
+        g7   = d7.groupby("batter")
+        hr7  = g7["events"].apply(lambda s: (s=="home_run").sum()).rename("hr_7d")
+        pa7  = g7["is_pa"].sum().rename("pa_7d")
+
+        # quality contact
+        bbe95 = g7.apply(lambda g: (pd.to_numeric(g.launch_speed, errors="coerce")>=95).sum()).rename("bbe95_7d")
+
+        # pulled airborne proxy (coarse but robust to missing spray): pull≈ launch_angle within [-20,20] + fly_ball
+        def _pulled_fly(g):
+            la_ok = pd.to_numeric(g.launch_angle, errors="coerce").between(-20,20)
+            fb_ok = (g.bb_type=="fly_ball")
+            return int((la_ok & fb_ok).sum())
+        pfly = g7.apply(_pulled_fly).rename("pulled_fly_7d")
+
+        # xwOBA on contact
+        xw = g7.apply(lambda g: pd.to_numeric(g.get("estimated_woba_using_speedangle", pd.Series(dtype=float)), errors="coerce").mean()) \
+               .rename("xwobacon_7d")
+
+        df7 = pd.concat([hr7, pa7, bbe95, pfly, xw], axis=1).reset_index()
+    else:
+        df7 = pd.DataFrame(columns=["batter","hr_7d","pa_7d","bbe95_7d","pulled_fly_7d","xwobacon_7d"])
+
+    # merge
+    df = pd.merge(df1, df7, how="outer", on="batter").fillna(0)
+    for _, r in df.iterrows():
+        out[int(r["batter"])] = {
+            "hr_1d":        int(r.get("hr_1d", 0)),
+            "pa_1d":        int(r.get("pa_1d", 0)),
+            "hr_7d":        int(r.get("hr_7d", 0)),
+            "pa_7d":        int(r.get("pa_7d", 0)),
+            "bbe95_7d":     int(r.get("bbe95_7d", 0)),
+            "pulled_fly_7d":int(r.get("pulled_fly_7d", 0)),
+            "xwobacon_7d":  float(r.get("xwobacon_7d", 0.0)) if pd.notna(r.get("xwobacon_7d", np.nan)) else 0.0
+        }
+    return out
+
+RECENT_EVT = build_recent_event_features()
+
+def get_recent_evt_feats(batter_pid) -> dict:
+    default = {"hr_1d":0,"pa_1d":0,"hr_7d":0,"pa_7d":0,"bbe95_7d":0,"pulled_fly_7d":0,"xwobacon_7d":0.0}
+    try:
+        pid = int(batter_pid)
+    except Exception:
+        return default
+    return RECENT_EVT.get(pid, default)
+
+@disk_cache("recent_pitcher_hr_allow.pkl")
+def build_pitcher_recent_hr_allow(days:int=30):
+    """
+    Returns {pitcher_id: {pa_30d, hr_30d, hrpa_30d, bbe95_allowed, pulled_fly_allowed}}
+    """
+    end = datetime.today()
+    s   = (end - timedelta(days=days)).strftime("%Y-%m-%d")
+    e   = end.strftime("%Y-%m-%d")
+    df  = _nz_df(fetch_statcast_raw(s, e))
+    if df.empty:
+        return {}
+
+    df = df.copy()
+    df["is_pa"] = df["events"].notna().astype(int)
+    for c in ("launch_speed","launch_angle"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    g   = df.groupby("pitcher")
+    pa  = g["is_pa"].sum().rename("pa")
+    hr  = g["events"].apply(lambda s: (s=="home_run").sum()).rename("hr")
+    b95 = g.apply(lambda g2: (pd.to_numeric(g2.launch_speed, errors="coerce")>=95).sum()).rename("bbe95")
+
+    # pulled airborne proxy per pitcher
+    def _pulled_fly(g2: pd.DataFrame) -> int:
+        la = pd.to_numeric(g2.get("launch_angle"), errors="coerce")
+        bt = g2.get("bb_type")
+        if la is None or bt is None:
+            return 0
+        # pulled ≈ launch_angle in [-20,20]; airborne = fly_ball
+        return int(((bt == "fly_ball") & la.between(-20, 20)).sum())
+
+    pf  = g.apply(lambda g2: _pulled_fly(g2)).rename("pulled_fly")
+    dd  = pd.concat([pa,hr,b95,pf], axis=1).reset_index()
+    dd["hrpa"] = dd["hr"]/dd["pa"].clip(lower=1)
+    return {int(r.pitcher): {"pa_30d": int(r.pa), "hr_30d": int(r.hr),
+                             "hrpa_30d": float(r.hrpa), "bbe95_allowed": int(r.bbe95),
+                             "pulled_fly_allowed": int(r.pulled_fly)} for _, r in dd.iterrows()}
+
+PIT_RECENT = build_pitcher_recent_hr_allow()
+
+def get_pitcher_recent(pid) -> dict:
+    default = {"pa_30d":0,"hr_30d":0,"hrpa_30d":0.0,"bbe95_allowed":0,"pulled_fly_allowed":0}
+    try:
+        pid = int(pid)
+    except Exception:
+        return default
+    return PIT_RECENT.get(pid, default)
+
+def batter_recent_multiplier(evt: dict) -> float:
+    """
+    Conservative 'hot-contact' bump:
+      • HR yesterday: +3%
+      • Hard-hit per PA (≥95 mph) last 7d: up to ±10%
+      • Pulled airborne contact per PA last 7d: up to ±12%
+      • xwOBAcon last 7d: up to ±12%
+    """
+    m = 1.0
+    if evt.get("hr_1d", 0) > 0:
+        m *= 1.03
+    pa7 = max(float(evt.get("pa_7d", 0)), 1.0)
+    hh_rate   = float(evt.get("bbe95_7d", 0)) / pa7
+    pfly_rate = float(evt.get("pulled_fly_7d", 0)) / pa7
+    xw = float(evt.get("xwobacon_7d", 0.0))
+
+    # league-ish anchors: hh/PA≈0.10, pulled_fly/PA≈0.035, xwOBAcon≈0.360
+    m *= float(np.clip(1.0 + 0.60*(hh_rate - 0.10), 0.90, 1.10))
+    m *= float(np.clip(1.0 + 0.70*(pfly_rate - 0.035), 0.90, 1.12))
+    if math.isfinite(xw) and xw > 0:
+        m *= float(np.clip(1.0 + 0.80*(xw - 0.360), 0.90, 1.12))
+    return float(np.clip(m, 0.85, 1.20))
+
+def pitcher_recent_multiplier(rec: dict, league_hrpa: float) -> float:
+    """
+    If a pitcher has been allowing more HR/PA over last 30d than league, nudge up to ±20%.
+    """
+    hrpa = float(rec.get("hrpa_30d", 0.0))
+    if hrpa <= 0 or league_hrpa <= 0:
+        return 1.0
+    rel = (hrpa/league_hrpa) - 1.0
+    return float(np.clip(1.0 + 0.50*rel, 0.80, 1.20))
+
 
 # ------------------------ league context ------------------------
 _LEAGUE_RE24 = {
@@ -1161,7 +1331,9 @@ __all__ = [
     'H_theta','H_p','TB_theta','TB_p','NB_K_theta','NB_K_p','LEAGUE_BAT',
     'predict_hits','predict_hits_interval','features_hit_base','league_hit_means','iso_hit_calibrators',
     'predict_hr_proba','predict_hr_count_pt','predict_hr_hardhit','predict_hr_2swhiff','predict_hr_pullangle',
-    'iso_pa_calibrators','expected_matchup_xiso','hr_game_cals','HR_LAMBDA_SCALE','infer_hr_archetype','IP_REG','batter_game_hr_prob'
+    'iso_pa_calibrators','expected_matchup_xiso','hr_game_cals','HR_LAMBDA_SCALE','infer_hr_archetype','IP_REG','batter_game_hr_prob',
+    'get_recent_evt_feats','batter_recent_multiplier','get_pitcher_recent','pitcher_recent_multiplier'
+
 ]
 
 def cache_all():
