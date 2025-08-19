@@ -6,12 +6,41 @@ It fetches/cleans data, builds pitcher and batter profiles, and runs probability
 ---
 
 ## Features
-- **Data layer (ETL-ready):** Loads CSVs from `data/` (sample files included). Stubs provided for Statcast/FanGraphs/MLB.com scrapers.
-- **Modeling:** 
-  - Pitcher strikeout projections (Poisson tails from K/9 + IP/start)  
-  - Batter hit/HR probabilities from per-PA rates  
-- **Outputs:** Starter KO probability tables, Batter prop tables (P(Hits≥1), P(HR≥1), etc.)
-- **Extensible:** Easy to plug in park factors, bullpen logic, and advanced regression models.
+
+### 🗄Data Layer & ETL
+- Loads input data from `data/` (CSV-based) with **sample datasets included** for instant demo.
+- ETL stubs provided for future integration with:
+  - **Statcast** (batted-ball profiles, pitcher whiff rates)  
+  - **FanGraphs** (advanced splits & projections)  
+  - **MLB.com** (lineups, injuries, team depth charts)  
+- Supports player lookup tables, lineup construction, and roster management.
+
+###  Statistical Modeling
+- **Pitcher Projections:** Poisson-based KO distributions from K/9 and IP/start.  
+- **Batter Projections:** Per-PA event probabilities (1B, 2B, 3B, HR, BB).  
+- **Monte Carlo Simulation (roadmap):** scalable engine to simulate thousands of games.  
+- **Negative Binomial Extensions (roadmap):** improved variance handling for Ks and hits.  
+
+###  Contextual Adjustments
+- Lineup-spot based expected plate appearances (1–9).  
+- Ready to incorporate **park factors, pace adjustments, and umpire tendencies**.  
+- Extensible to account for **bullpen fatigue, travel effects, and injuries**.  
+
+###  Outputs & Reporting
+- **Starter KO probability tables** (e.g., P(K≥4), P(K≥6), 90% CIs).  
+- **Batter prop tables** with P(Hits≥1), P(HR≥1), P(2B≥1), P(3B≥1).  
+- Outputs printed to console in **clean tabular format**.  
+- Future: export results to **CSV/Excel** for integration with dashboards or betting models.  
+
+###  Extensible Design
+- Modular architecture:  
+  - `fetch.py` → handles ETL & data loading  
+  - `precompute.py` → builds player profiles & probability models  
+  - `gameday_sim.py` → orchestrates simulations & reporting  
+- Easy to extend with:
+  - **Regression models (scikit-learn, XGBoost)**  
+  - **Bayesian updates** with live data  
+  - **Full-game simulation with Markov chain or run expectancy matrices**  
 
 ```
 nba_model/
