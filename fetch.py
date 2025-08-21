@@ -340,6 +340,17 @@ def roster_map(team_abbr: str) -> dict:
 # PARK FACTORS
 # ───────────────────────────────────────────────────────────────────────────────
 LOCAL_PF = {}
+# Canonical -> list of aliases that might appear in schedule/output
+PF_CANON_ALIASES = {
+    "OAK": ["ATH"],
+    "ARI": ["AZ"],
+    "CHW": ["CWS"],
+    "WSN": ["WSH"],
+    "KCR": ["KC"],
+    "TBR": ["TB"],
+    "SFG": ["SF"],
+    "SDP": ["SD"],
+}
 if Path("park_factors.csv").exists():
     pf_df = pd.read_csv("park_factors.csv")
     for _,row in pf_df.iterrows():
@@ -365,12 +376,27 @@ def fetch_yearly_park_factors(year:int)->dict:
 
 @disk_cache("monthly_pf.pkl")
 def fetch_monthly_park_factors(year:int)->dict:
-    if LOCAL_PF: return LOCAL_PF
+    if LOCAL_PF:
+        # Also mirror aliases into LOCAL_PF so lookups never miss
+        out = {ab: months.copy() for ab, months in LOCAL_PF.items()}
+        for canon, aliases in PF_CANON_ALIASES.items():
+            if canon in out:
+                for al in aliases:
+                    out[al] = out[canon]
+        return out
+
     url=f"https://www.fangraphs.com/park-factors?season={year}&teamId=0&position=all&split=monthly"
     r=safe_get(url)
     if not r:
         yearly=fetch_yearly_park_factors(year)
-        return {ab:{m:v.copy() for m in range(1,13)} for ab,v in yearly.items()}
+        base = {ab:{m:v.copy() for m in range(1,13)} for ab,v in yearly.items()}
+        # Mirror canonical -> aliases
+        for canon, aliases in PF_CANON_ALIASES.items():
+            if canon in base:
+                for al in aliases:
+                    base[al] = base[canon]
+        return base
+
     tbl=pd.read_html(r.text)[0]
     tbl.columns=[str(c).strip() for c in tbl.columns]
     mm={datetime(year,i,1).strftime("%b"):i for i in range(1,13)}
@@ -380,18 +406,25 @@ def fetch_monthly_park_factors(year:int)->dict:
         if not ab: continue
         out.setdefault(ab,{})
         for col in tbl.columns[1:]:
-            mon,met=col.split()
+            parts = col.split()
+            if len(parts) != 2:
+                continue
+            mon,met = parts
             m=mm.get(mon)
             if not m: continue
             val=float(row[col]) if pd.notna(row[col]) else 100.0
             slot=out[ab].setdefault(m,{"R":100,"HR":100,"SO":100,"BA":100})
-            if met=="R": slot["R"]=val
+            if   met=="R":  slot["R"]=val
             elif met=="HR": slot["HR"]=val
             elif met in ("SO","K%"): slot["SO"]=val
             elif met=="BA": slot["BA"]=val
-    return out
 
-monthly_pf = fetch_monthly_park_factors(YEAR)
+    # Add alias keys so mpf.get(home, {}) works for TB/ATH/AZ etc.
+    for canon, aliases in PF_CANON_ALIASES.items():
+        if canon in out:
+            for al in aliases:
+                out[al] = out[canon]
+    return out
 
 # ───────────────────────────────────────────────────────────────────────────────
 # UMPIRE CONTEXT
@@ -440,22 +473,36 @@ def umpire_adjustments(game_pk:int)->Tuple[float,float]:
 # ───────────────────────────────────────────────────────────────────────────────
 # CATCHER FRAMING
 # ───────────────────────────────────────────────────────────────────────────────
-@disk_cache("catcher_framing_{0}.pkl", ttl_days=7)
-def get_catcher_framing_leaderboard(year:int)->pd.DataFrame:
-    url=f"https://baseballsavant.mlb.com/catcher_framing?year={year}"
-    r=safe_get(url)
-    if not r: return pd.DataFrame()
-    df=pd.read_html(r.text)[0]
-    df.columns=[c.replace("\n"," ").strip() for c in df.columns]
-    return df
+# in fetch.py
+def get_catcher_framing_leaderboard(year: int) -> pd.DataFrame:
+    """
+    Pulls Baseball Savant's Catcher Framing leaderboard as CSV.
+    Note: Savant renders tables client-side; use the CSV export.
+    """
+    base = "https://baseballsavant.mlb.com/leaderboard/catcher-framing"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    # Try explicit season; if the site ignores it, you'll still get current season
+    for params in ({"season": str(year), "csv": "true"}, {"csv": "true"}):
+        r = requests.get(base, params=params, headers=headers, timeout=30)
+        if r.ok and "," in r.text:
+            return pd.read_csv(io.StringIO(r.text))
+    raise RuntimeError("Unable to fetch Savant catcher framing CSV")
 
-def framing_runs_for(catcher_name:str)->float:
-    df=get_catcher_framing_leaderboard(YEAR)
-    rec=df[df["Catcher"]==catcher_name]
-    # minor robustness fix:
-    if rec.empty or "Framing Runs" not in df.columns: 
+def framing_runs_for(catcher_name: str) -> float:
+    df = get_catcher_framing_leaderboard(YEAR)
+    # normalize column names and pick the framing-runs column
+    cols = {c.lower(): c for c in df.columns}
+    name_col = cols.get("player") or cols.get("player_name") or cols.get("catcher") or "player"
+    # Savant labels can change; handle common cases
+    frm_col = (cols.get("framing runs") or cols.get("runs (framing)") or
+               cols.get("runs_framing") or cols.get("frm"))
+    if frm_col is None:
         return 0.0
-    return float(rec["Framing Runs"].iloc[0])
+    df["Name_norm"] = df[name_col].astype(str).str.upper().str.strip()
+    key = catcher_name.upper().strip()
+    row = df[df["Name_norm"] == key]
+    return float(row.iloc[0][frm_col]) if not row.empty else 0.0
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # DAYS REST & TRAVEL
@@ -644,7 +691,14 @@ def fetch_lineup_and_starters(away:str, home:str):
     roster=roster_map(away)
     nm_map={v:k for k,v in roster.items()}
     away_cname=nm_map.get(away_cid,""); home_cname=nm_map.get(home_cid,"")
-    framing_feats={"away_frame":framing_runs_for(away_cname),"home_frame":framing_runs_for(home_cname)}
+    try:
+        framing_feats = {
+            "away_frame": framing_runs_for(away_cname),
+            "home_frame": framing_runs_for(home_cname),
+        }
+    except Exception as e:
+        logging.warning(f"Framing disabled (using 0s): {e}")
+        framing_feats = {"away_frame": 0.0, "home_frame": 0.0}
 
     # sanity checks
     if not a_name or not h_name:
@@ -665,12 +719,6 @@ def fetch_lineup_and_starters(away:str, home:str):
         if bid and bid not in statcast_bat_cache:
             statcast_bat_cache[bid]=get_statcast_batter_features(bid)
 
-    for bid in away_bat_ids+home_bat_ids:
-        if not bid: continue
-        for days in (7,14):
-            bb=get_recent_bb_stats(bid,days)
-            if bb:
-                statcast_bat_cache[bid].update(bb)
     for bid in away_bat_ids+home_bat_ids:
         for pid in (a_pid,h_pid):
             if bid and pid and (bid,pid) not in h2h_cache:
@@ -888,7 +936,6 @@ def get_statcast_batter_features(pid:int, days:int=180)->dict:
     if df.empty or "game_date" not in df.columns:
         return {}
 
-    # Dates & windows (define once so we can reuse safely)
     df = df.copy()
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     now     = datetime.today()
@@ -899,60 +946,73 @@ def get_statcast_batter_features(pid:int, days:int=180)->dict:
 
     feats = {}
 
-    # Exit velocity
+    # Exit velocity + hard-hit (>=95)
     if "launch_speed" in df.columns:
-        feats["ev_mean"]     = _safe_mean(df["launch_speed"])
-        feats["hard_hit_pct"] = _safe_frac(df["launch_speed"] > 95)
+        feats["ev_mean"]        = _safe_mean(df["launch_speed"])
+        feats["hard_hit_pct"]   = _safe_frac(df["launch_speed"] > 95)
 
-        feats["ev_7d_mean"]   = _safe_mean(df7["launch_speed"])
-        feats["hard_7d_pct"]  = _safe_frac(df7["launch_speed"] > 95)
-
-        feats["ev_14d_mean"]  = _safe_mean(df14["launch_speed"])
-        feats["hard_14d_pct"] = _safe_frac(df14["launch_speed"] > 95)
+        feats["ev_mean_14d"]    = _safe_mean(df14["launch_speed"])   # <- renamed
+        feats["hardhit_14d_pct"]= _safe_frac(df14["launch_speed"] > 95)  # <- renamed
     else:
         feats.update({
             "ev_mean":0.0, "hard_hit_pct":0.0,
-            "ev_7d_mean":0.0, "hard_7d_pct":0.0,
-            "ev_14d_mean":0.0, "hard_14d_pct":0.0
+            "ev_mean_14d":0.0, "hardhit_14d_pct":0.0
         })
 
     # Launch angle
     if "launch_angle" in df.columns:
-        feats["la_mean"]     = _safe_mean(df["launch_angle"])
-        feats["la_7d_mean"]  = _safe_mean(df7["launch_angle"])
-        feats["la_14d_mean"] = _safe_mean(df14["launch_angle"])
+        feats["la_mean"] = _safe_mean(df["launch_angle"])
     else:
-        feats.update({"la_mean":0.0, "la_7d_mean":0.0, "la_14d_mean":0.0})
+        feats["la_mean"] = 0.0
 
-    # Barrel rate (0/1)
+    # Barrel rate
     if "barrel" in df.columns:
-        feats["barrel_pct"]      = _safe_frac(df["barrel"])
-        feats["barrel_7d_pct"]   = _safe_frac(df7["barrel"])
-        feats["barrel_14d_pct"]  = _safe_frac(df14["barrel"])
+        feats["barrel_pct"]     = _safe_frac(df["barrel"])
+        feats["barrel_14d_pct"] = _safe_frac(df14["barrel"])
     else:
-        feats.update({"barrel_pct":0.0, "barrel_7d_pct":0.0, "barrel_14d_pct":0.0})
+        # proxy barrel% if needed (EV >= 98 and 26–30°)
+        if {"launch_speed","launch_angle"}.issubset(df.columns):
+            prox_all  = ((pd.to_numeric(df["launch_speed"], errors="coerce") >= 98) &
+                         pd.to_numeric(df["launch_angle"], errors="coerce").between(26, 30))
+            prox_14   = ((pd.to_numeric(df14["launch_speed"], errors="coerce") >= 98) &
+                         pd.to_numeric(df14["launch_angle"], errors="coerce").between(26, 30))
+            feats["barrel_pct"]     = _safe_frac(prox_all)
+            feats["barrel_14d_pct"] = _safe_frac(prox_14)
+        else:
+            feats["barrel_pct"] = 0.0
+            feats["barrel_14d_pct"] = 0.0
 
-    # “Sweet-spot” 105+ EV & 25–35° LA
+    # “Sweet spot” proxy (105+ EV & 25–35°)
     if {"launch_speed","launch_angle"}.issubset(df.columns) and len(df) > 0:
-        feats["sweet_spot_frac"] = _safe_frac((pd.to_numeric(df["launch_speed"], errors="coerce") > 105) &
-                                              (pd.to_numeric(df["launch_angle"], errors="coerce").between(25, 35)))
+        feats["sweet_spot_frac"] = _safe_frac(
+            (pd.to_numeric(df["launch_speed"], errors="coerce") > 105) &
+            pd.to_numeric(df["launch_angle"], errors="coerce").between(25, 35)
+        )
     else:
         feats["sweet_spot_frac"] = 0.0
 
-        # Stance (bats L/R) – prefer Statcast column; fallback to API
+    # Pull% proxy (LA in [-20, 20])
+    if "launch_angle" in df.columns:
+        feats["pull_pct"] = _safe_frac(pd.to_numeric(df["launch_angle"], errors="coerce").between(-20, 20))
+    else:
+        feats["pull_pct"] = 0.40
+
+    # Stance (bats L/R) – prefer Statcast column; fallback to API
     if "stand" in df.columns:
         s = df["stand"].dropna().astype(str)
-        st = s.mode().iloc[0].upper()[0] if not s.empty else batter_bats(pid)
+        feats["stand"] = s.mode().iloc[0].upper()[0] if not s.empty else batter_bats(pid)
     else:
-        st = batter_bats(pid)
-    feats["stand"] = st
+        feats["stand"] = batter_bats(pid)
 
-    # Crude pull proxy (consistent with your HR micros): LA between -20..20
-    if "launch_angle" in df.columns:
-        la = pd.to_numeric(df["launch_angle"], errors="coerce")
-        feats["pull_pct"] = _safe_frac(la.between(-20, 20))
+    # HR/FB rate over the whole window
+    if {"events","bb_type"}.issubset(df.columns):
+        evs = df["events"].astype(str).str.lower()
+        bbt = df["bb_type"].astype(str).str.lower()
+        hr = (evs == "home_run").sum()
+        fb = (bbt == "fly_ball").sum()
+        feats["HR_FB_rate"] = float(hr / fb) if fb > 0 else 0.0
     else:
-        feats["pull_pct"] = 0.40  # neutral default
+        feats["HR_FB_rate"] = 0.0
 
     return feats
 
@@ -1260,10 +1320,21 @@ def get_game_weather(game_pk:int)->dict:
     url=f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore"
     r=safe_get(url)
     if not r: return {}
-    w=r.json().get("gameData",{}).get("weather",{})
-    return {"temp_F":w.get("temperature"),"wind_mph":w.get("windMiles"),
-            "wind_dir":w.get("windDirection"),"conditions":w.get("condition"),
-            "humidity":w.get("humidityPercent")}
+    w = r.json().get("gameData",{}).get("weather",{}) or {}
+    # Normalize temperature to a float if possible
+    t = w.get("temperature")
+    if isinstance(t, str):
+        m = re.search(r"(\d+(\.\d+)?)", t)
+        tval = float(m.group(1)) if m else None
+    else:
+        tval = float(t) if isinstance(t,(int,float)) else None
+    return {
+        "temp_f": tval,  # <- lowercase key to match simulator
+        "wind_mph": w.get("windMiles"),
+        "wind_dir": w.get("windDirection"),
+        "conditions": w.get("condition"),
+        "humidity": w.get("humidityPercent")
+    }
 
 def tail_wind_pct(game_pk: int) -> float:
     """
