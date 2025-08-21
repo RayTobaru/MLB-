@@ -21,6 +21,7 @@ Exports:
   expected_matchup_xiso, features_base, league_feature_means, LEAGUE_BAT, IP_REG, etc.
 """
 
+import json
 import io, pickle, cloudpickle, logging, functools
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -38,6 +39,8 @@ from sklearn.base import clone
 import xgboost as xgb
 import lightgbm as lgb
 import math
+from functools import lru_cache
+import re
 
 from fetch import (
     ID2ABBR, YEAR,
@@ -52,6 +55,12 @@ from fetch import (
     framing_runs_for, get_pitch_type_profile, pitcher_mix_last_starts, batter_xiso_by_pitch,
     team_bullpen_hrpa, tail_wind_pct, full_pitching_staff
 )
+
+# --- Caching paths (top of file is fine) ---
+B14_PATH = "cache/b14_feats.parquet"
+SEASON_SPLITS_PATH = "cache/season_hr_splits.json"
+PITCH_SIDE_PATH = "cache/pitcher_vs_side_hr.json"
+
 
 # --- Robust imports so Pylance never flags "undefined" ---
 try:
@@ -71,6 +80,44 @@ CACHE_DIR = Path("./cache"); CACHE_DIR.mkdir(exist_ok=True)
 print("CACHE_DIR is:", CACHE_DIR.resolve())
 
 SIMS_K = 5000
+# Dirichlet smoothing strengths (small = light, big = heavy)
+COUNT_PT_ALPHA_MIX = 12.0   # prior mass for P(pitch_type | count, side)
+COUNT_PT_ALPHA_END = 60.0   # prior mass for P(end-with-contact at count)
+
+
+# --- Season ISO lookup (cached) ---
+@lru_cache(None)
+def _season_iso_map(year: int = YEAR) -> dict:
+    try:
+        df = batting_stats(year, qual=0).copy()
+        df["Name_norm"] = df.Name.apply(clean_name)
+        df["pid"] = df["Name_norm"].apply(name_to_mlbam_id)
+        return df.set_index("pid")["ISO"].to_dict()
+    except Exception:
+        return {}
+
+def get_season_iso(pid: int | None) -> float:
+    if not pid:
+        return float("nan")
+    try:
+        return float(_season_iso_map().get(int(pid), float("nan")))
+    except Exception:
+        return float("nan")
+
+# --- Temperature → HR multiplier (small, capped) ---
+def _temp_multiplier(temp_f) -> float:
+    # Accept int/float or strings like "78 F"
+    if temp_f is None:
+        return 1.0
+    try:
+        t = float(temp_f)
+    except Exception:
+        m = re.search(r"(-?\d+(\.\d+)?)", str(temp_f))
+        t = float(m.group(1)) if m else float("nan")
+    if not np.isfinite(t):
+        return 1.0
+    # ~+1% HR per +5°F above 70, capped ±7%
+    return float(np.clip(1.0 + 0.01 * ((t - 70.0) / 5.0), 0.93, 1.07))
 
 # ------------------------ cache helpers ------------------------
 def disk_cache(filename):
@@ -129,6 +176,376 @@ def parquet_cache_df(key_fmt: str):
 def _nz_df(df):
     """Return df if it's a non-empty DataFrame, else an empty DataFrame."""
     return df if (isinstance(df, pd.DataFrame) and not df.empty) else pd.DataFrame()
+
+# ===== NEW: lightweight caches the simulator can read quickly =====
+from pathlib import Path
+import os
+
+_B14_PATH             = Path("cache/b14_feats.parquet")
+_SEASON_SPLITS_PATH   = Path("cache/season_hr_splits.pkl")
+_PITCHER_SIDE_HR_PATH = Path("cache/pitcher_vs_side_hr.pkl")
+
+def build_b14_feats(days_window=180, days_recent=14, out_path=B14_PATH):
+    """
+    Precompute last-14-day batter features:
+      - barrel_14d_pct
+      - hardhit_14d_pct (EV >= 95 mph)
+      - ev_mean_14d
+    Writes a parquet (or csv fallback) and returns a DataFrame indexed by batter.
+    """
+    end = datetime.today().date()
+    start = end - timedelta(days=days_window)
+
+    df = fetch_statcast_raw(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    # Empty / missing case -> write empty frame with schema
+    if df is None or df.empty or "batter" not in df.columns:
+        out = pd.DataFrame(columns=["batter","barrel_14d_pct","hardhit_14d_pct","ev_mean_14d"]).set_index("batter")
+        try: out.to_parquet(out_path)
+        except Exception: out.to_csv(out_path.replace(".parquet",".csv"))
+        return out
+
+    # Filter to last N days
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+        df = df[df["game_date"] >= pd.Timestamp(end - timedelta(days=days_recent))]
+
+    # Keep valid batters
+    df = df[pd.to_numeric(df.get("batter"), errors="coerce").notna()].copy()
+    if df.empty:
+        out = pd.DataFrame(columns=["batter","barrel_14d_pct","hardhit_14d_pct","ev_mean_14d"]).set_index("batter")
+        try:
+            out.to_parquet(out_path)
+        except Exception:
+            out.to_csv(out_path.replace(".parquet", ".csv"))
+        return out
+
+    df["batter"] = df["batter"].astype(int)
+
+    # Exit velocity (ls) – robust to missing column
+    if "launch_speed" in df.columns:
+        df["ls"] = pd.to_numeric(df["launch_speed"], errors="coerce")
+    else:
+        df["ls"] = np.nan  # broadcast NaN
+
+    # Barrel flag – prefer explicit flag, fallback proxy
+    if "is_barrel" not in df.columns:
+        if "barrel" in df.columns:
+            df["is_barrel"] = (pd.to_numeric(df["barrel"], errors="coerce") == 1)
+        else:
+            if "launch_angle" in df.columns:
+                la = pd.to_numeric(df["launch_angle"], errors="coerce")
+            else:
+                la = pd.Series(np.nan, index=df.index)
+            df["is_barrel"] = la.between(26, 30) & (df["ls"] >= 98)
+
+    # ensure boolean has no NA so .mean() is safe
+    df["is_barrel"] = df["is_barrel"].fillna(False)
+
+   # --- helpers (place them just above the groupby) ---
+    def _safe_mean_numeric(s):
+        v = pd.to_numeric(s, errors="coerce")
+        m = v.mean(skipna=True)
+        return float(m) if pd.notna(m) else np.nan
+
+    def _frac_ge_numeric(s, thresh):
+        v = pd.to_numeric(s, errors="coerce")
+        n = int(v.notna().sum())
+        if n == 0:
+            return 0.0
+        return float((v[v.notna()] >= thresh).sum()) / n
+
+    # --- aggregate robustly ---
+    agg = df.groupby("batter").agg(
+        barrel_14d_pct=("is_barrel", lambda s: float(s.astype("float").mean())),
+        hardhit_14d_pct=("ls",       lambda s: _frac_ge_numeric(s, 95)),
+        ev_mean_14d    =("ls",       _safe_mean_numeric),
+    ).reset_index()
+
+    # clean, index, save once
+    agg = agg.replace([np.inf, -np.inf], np.nan).set_index("batter")
+    try:
+        agg.to_parquet(out_path)
+    except Exception:
+        agg.to_csv(out_path.replace(".parquet", ".csv"))
+
+    return agg
+
+def load_b14_feats(path=B14_PATH):
+    """Load the 14d batter feats cache (parquet or csv). Returns DataFrame indexed by batter or empty DF."""
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        try:
+            return pd.read_csv(path.replace(".parquet",".csv"), index_col=0)
+        except Exception:
+            return pd.DataFrame()
+
+@disk_cache("count_pt_tables.pkl")
+@disk_cache("count_pt_tables.pkl")
+def build_count_pitchtype_tables(days: int = 365):
+    """
+    Returns (already SMOOTHED):
+      {
+        "PITCH": {pitcher_id: {"L": {"ALL":{pt:prob}, "0-0":{pt:prob}, ...},
+                               "R": {...}}},
+        "BAT":   {batter_id: {"0-0":prob, "1-0":prob, ...}},   # P(AB ends with CONTACT at that count)
+        "PRIORS": {
+            "end_at_count": {"0-0":p, "1-0":p, ...},          # league contact-ending distribution
+            "mix": {"L": {"ALL":{pt:prob}, "0-0":{pt:prob}, ...},
+                    "R": {"ALL":{pt:prob}, "0-0":{pt:prob}, ...}}
+        }
+      }
+    (All maps are already Dirichlet-smoothed toward league priors.)
+    """
+    end = datetime.today()
+    start = (end - timedelta(days=days)).strftime("%Y-%m-%d")
+    df = fetch_statcast_raw(start, end.strftime("%Y-%m-%d"))
+
+    out = {"PITCH": {}, "BAT": {}, "PRIORS": {"end_at_count": {}, "mix": {"L": {}, "R": {}}}}
+    if df is None or df.empty:
+        return out
+
+    df = df.copy()
+    # normalize basics
+    for c in ("balls", "strikes"):
+        if c not in df.columns:
+            df[c] = 0
+    df["count"] = df["balls"].astype(int).astype(str) + "-" + df["strikes"].astype(int).astype(str)
+
+    if "stand" not in df.columns:
+        df["stand"] = "R"
+    df["side_bat"] = df["stand"].astype(str).str.upper().str[0].where(df["stand"].isin(["L","R"]), "R")
+
+    if "pitch_type" not in df.columns:
+        df["pitch_type"] = "FF"  # safe default
+
+    # Contact-ending PA proxy
+    contact_events = {
+        "single","double","triple","home_run","field_out","force_out",
+        "grounded_into_double_play","double_play","fielders_choice_out"
+    }
+    if "events" not in df.columns:
+        df["events"] = ""
+    df["is_contact_end"] = df["events"].astype(str).isin(contact_events)
+
+    # ---------- League priors ----------
+    # End-at-count prior
+    end_contact = df[df["is_contact_end"]]
+    if not end_contact.empty:
+        lec = end_contact["count"].value_counts(normalize=True)
+        out["PRIORS"]["end_at_count"] = {k: float(v) for k, v in lec.items()}
+    else:
+        out["PRIORS"]["end_at_count"] = {"0-0": 1.0}
+
+    # Pitch-type prior by side and count (and ALL)
+    for side in ("L","R"):
+        gs = df[df["side_bat"] == side]
+        if gs.empty:
+            # minimal fallback
+            out["PRIORS"]["mix"][side]["ALL"] = {"FF": 1.0}
+            continue
+        all_mix = gs["pitch_type"].value_counts(normalize=True)
+        out["PRIORS"]["mix"][side]["ALL"] = {pt: float(p) for pt, p in all_mix.items()}
+        for c, gc in gs.groupby("count"):
+            vc = gc["pitch_type"].value_counts(normalize=True)
+            out["PRIORS"]["mix"][side][c] = {pt: float(p) for pt, p in vc.items()}
+
+    # helper: Dirichlet smooth counts -> probs using a prior dict
+    def _smooth(counts: pd.Series, prior: dict[str,float], alpha: float) -> dict[str,float]:
+        counts = counts.copy()
+        counts = counts[counts > 0]
+        N = float(counts.sum())
+        # ensure the support is union of observed and prior keys
+        keys = set(counts.index.tolist()) | set(prior.keys())
+        # normalized prior over support
+        p_prior = np.array([prior.get(k, 0.0) for k in keys], dtype=float)
+        p_prior = p_prior / p_prior.sum() if p_prior.sum() > 0 else np.ones(len(keys)) / max(len(keys), 1)
+        c_obs = np.array([float(counts.get(k, 0.0)) for k in keys], dtype=float)
+        num = c_obs + alpha * p_prior
+        den = N + alpha
+        probs = num / den if den > 0 else p_prior
+        return {k: float(p) for k, p in zip(keys, probs)}
+
+    # ---------- Pitcher-specific: P(pt | count, side), smoothed toward league prior ----------
+    if "pitcher" in df.columns:
+        for pid, g in df.groupby("pitcher"):
+            side_map = {}
+            for side, gs in g.groupby("side_bat"):
+                cm = {}
+
+                # choose priors
+                prior_all = out["PRIORS"]["mix"].get(side, {}).get("ALL", {"FF": 1.0})
+
+                # ALL
+                vc_all = gs["pitch_type"].value_counts()
+                cm["ALL"] = _smooth(vc_all, prior_all, COUNT_PT_ALPHA_MIX)
+
+                # per-count
+                for c, gc in gs.groupby("count"):
+                    vc = gc["pitch_type"].value_counts()
+                    prior_c = out["PRIORS"]["mix"].get(side, {}).get(c, prior_all)
+                    cm[c] = _smooth(vc, prior_c, COUNT_PT_ALPHA_MIX)
+
+                side_map[side] = cm
+            out["PITCH"][int(pid)] = side_map
+
+    # ---------- Batter-specific: P(end-with-contact at count), smoothed toward league prior ----------
+    if "batter" in df.columns:
+        bg = df[df["is_contact_end"]]
+        lec = out["PRIORS"]["end_at_count"]
+        for bid, g in bg.groupby("batter"):
+            vc = g["count"].value_counts()
+            out["BAT"][int(bid)] = _smooth(vc, lec, COUNT_PT_ALPHA_END)
+
+    return out
+
+@disk_cache("heart_rate_60d.pkl")
+def build_heart_rate_table(days: int = 60):
+    """
+    Returns {"league": heart_pct_league, "pitcher": {pid: heart_pct}}
+    'Heart' is approximated by Statcast zone in {5, 2, 8, 4, 6} when 'zone' exists;
+    else fallback to a tight box with plate_x/plate_z.
+    """
+    end = datetime.today()
+    start = (end - timedelta(days=days)).strftime("%Y-%m-%d")
+    df = fetch_statcast_raw(start, end.strftime("%Y-%m-%d"))
+    if df is None or df.empty:
+        return {"league": 0.15, "pitcher": {}}
+
+    df = df.copy()
+    heart_mask = pd.Series(False, index=df.index)
+
+    if "zone" in df.columns:
+        # strike-zone 1..9 grid; treat crosshair + center as "heart"
+        heart_z = {2,4,5,6,8}  # conservative 'heart' set
+        heart_mask = df["zone"].isin(list(heart_z))
+    else:
+        # fallback rectangle for heart: middle 1/3 both ways (roughly)
+        if {"plate_x","plate_z"}.issubset(df.columns):
+            px = pd.to_numeric(df["plate_x"], errors="coerce")
+            pz = pd.to_numeric(df["plate_z"], errors="coerce")
+            # strike zone ~ [-0.83, 0.83] x [1.5, 3.5]. Middle third tighter:
+            heart_mask = (px.abs() <= 0.28) & (pz.between(2.3, 3.0))
+        else:
+            return {"league": 0.15, "pitcher": {}}
+
+    heart = heart_mask.astype(int)
+    league = float(heart.mean()) if len(heart) else 0.15
+
+    out = {"league": league, "pitcher": {}}
+    if "pitcher" in df.columns:
+        for pid, g in df.groupby("pitcher"):
+            out["pitcher"][int(pid)] = float(heart.loc[g.index].mean()) if len(g) else league
+    return out
+
+def build_pitcher_vs_side_hr(days=365, out_path=PITCH_SIDE_PATH):
+    """
+    Build {pitcher_id: {"vs_L_HR_rate": float, "vs_R_HR_rate": float}}
+    using last `days` of Statcast. Writes JSON and returns dict.
+    HR_rate = HR / PA (where PA ~= events non-null).
+    """
+    end   = datetime.today()
+    start = (end - timedelta(days=days)).strftime("%Y-%m-%d")
+    sc    = fetch_statcast_raw(start, end.strftime("%Y-%m-%d"))
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    if sc is None or sc.empty or "pitcher" not in sc.columns:
+        with open(out_path, "w") as f: json.dump({}, f)
+        return {}
+
+    g = sc.copy()
+    g["pitcher"] = pd.to_numeric(g["pitcher"], errors="coerce")
+    g = g.dropna(subset=["pitcher"]).copy()
+    if g.empty:
+        with open(out_path, "w") as f: json.dump({}, f)
+        return {}
+
+    g["pitcher"] = g["pitcher"].astype(int)
+    g["is_pa"]   = g["events"].notna().astype(int)
+    g["is_hr"]   = g["events"].astype(str).str.lower().eq("home_run").astype(int)
+
+    if "stand" not in g.columns:
+        with open(out_path, "w") as f: json.dump({}, f)
+        return {}
+
+    g["stand"] = g["stand"].astype(str).str.upper().str[0].where(g["stand"].isin(["L","R"]))
+    g = g.dropna(subset=["stand"])
+
+    out = {}
+    for pid, sub in g.groupby("pitcher"):
+        rec = {}
+        for side in ("L","R"):
+            ss = sub[sub["stand"] == side]
+            pa = int(ss["is_pa"].sum())
+            hr = int(ss["is_hr"].sum())
+            rec[f"vs_{side}_HR_rate"] = (hr / max(pa, 1))
+        out[int(pid)] = rec
+
+    with open(out_path, "w") as f:
+        json.dump(out, f)
+    return out
+
+
+def load_pitcher_vs_side_hr(path=PITCH_SIDE_PATH):
+    """Load pitcher vs-side HR rates dict; return {} if missing."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+
+def build_pitcher_vs_side_hr(days=365, out_path=PITCH_SIDE_PATH):
+    """
+    Build {pitcher_id: {"vs_L_HR_rate": float, "vs_R_HR_rate": float}}
+    using last `days` of Statcast. Writes JSON and returns dict.
+    HR_rate = HR / PA (where PA ~= events non-null).
+    """
+    end   = datetime.today()
+    start = (end - timedelta(days=days)).strftime("%Y-%m-%d")
+    sc    = fetch_statcast_raw(start, end.strftime("%Y-%m-%d"))
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    if sc is None or sc.empty or "pitcher" not in sc.columns:
+        with open(out_path, "w") as f: json.dump({}, f)
+        return {}
+
+    g = sc.copy()
+    g["pitcher"] = pd.to_numeric(g["pitcher"], errors="coerce")
+    g = g.dropna(subset=["pitcher"]).copy()
+    if g.empty:
+        with open(out_path, "w") as f: json.dump({}, f)
+        return {}
+
+    g["pitcher"] = g["pitcher"].astype(int)
+    g["is_pa"]   = g["events"].notna().astype(int)
+    g["is_hr"]   = g["events"].astype(str).str.lower().eq("home_run").astype(int)
+
+    if "stand" not in g.columns:
+        with open(out_path, "w") as f: json.dump({}, f)
+        return {}
+
+    g["stand"] = g["stand"].astype(str).str.upper().str[0].where(g["stand"].isin(["L","R"]))
+    g = g.dropna(subset=["stand"])
+
+    out = {}
+    for pid, sub in g.groupby("pitcher"):
+        rec = {}
+        for side in ("L","R"):
+            ss = sub[sub["stand"] == side]
+            pa = int(ss["is_pa"].sum())
+            hr = int(ss["is_hr"].sum())
+            rec[f"vs_{side}_HR_rate"] = (hr / max(pa, 1))
+        out[int(pid)] = rec
+
+    with open(out_path, "w") as f:
+        json.dump(out, f)
+    return out
 
 def expected_sp_ip_simple(starter_pid: int) -> float:
     """
@@ -472,13 +889,16 @@ def train_ensemble_k9_model():
             LP_full[c] = 0.0
 
     mpf = fetch_monthly_park_factors(YEAR); m = datetime.today().month
-    LP_full["wind_tail_pct"]  = 0.0
-    LP_full["park_hr_factor"] = LP_full["Team"].map(lambda t: mpf.get(t,{}).get(m,{}).get("HR",100)/100.0)
+    LP_full["park_k_factor"] = LP_full["Team"].map(
+        lambda t: mpf.get(t, {}).get(m, {}).get("SO", 100) / 100.0
+    )
 
     base_feats = ["SwStr%","K%","FIP","BB%","WHIP","IP_per_start","Shrunk_K9","Shrunk_ERA",
-                  "FB_pct","OS_pct","SwStr_FB","SwStr_OS",
-                  "ev_mean_7d","ev_std_7d","la_mean_7d","barrel_pct_7d",
-                  "ev_mean_14d","ev_std_14d","la_mean_14d","barrel_pct_14d","wind_tail_pct","park_hr_factor"]
+              "FB_pct","OS_pct","SwStr_FB","SwStr_OS",
+              "ev_mean_7d","ev_std_7d","la_mean_7d","barrel_pct_7d",
+              "ev_mean_14d","ev_std_14d","la_mean_14d","barrel_pct_14d",
+              "park_k_factor"]
+
     for c in ("FB_pct","OS_pct","SwStr_FB","SwStr_OS"):
         if c in LP_full.columns:
             LP_full[c] = LP_full[c].fillna(0.0)
@@ -751,6 +1171,19 @@ def train_hr_count_pt_model():
     y = sb.HR
     return LogisticRegression(max_iter=1500).fit(X, y), X.columns.tolist()
 
+def build_hr_count_pt_onehot(count: str, pitch_type: str) -> pd.Series:
+    """
+    Returns a Series aligned to the trained logistic's columns for (count, pitch_type).
+    Unknown dummies are silently ignored.
+    """
+    row = {col: 0 for col in _hr_count_pt_cols}
+    ckey = f"count_{count}"
+    pkey = f"pitch_type_{pitch_type}"
+    if ckey in row: row[ckey] = 1
+    if pkey in row: row[pkey] = 1
+    return pd.Series(row)
+
+
 _hr_count_pt_model, _hr_count_pt_cols = train_hr_count_pt_model()
 def predict_hr_count_pt(feat_row: pd.Series) -> float:
     X = feat_row.reindex(_hr_count_pt_cols, fill_value=0).values.reshape(1, -1)
@@ -815,62 +1248,95 @@ def batter_game_hr_prob(
 ) -> float:
     """
     Estimate P(HR≥1) for a batter in a game by blending vs-starter and vs-bullpen
-    HR/PA, then applying park+wind and matchup xISO, and finally calibrating
-    with the per-PA isotonic (HR,1).
+    HR/PA, then applying matchup xISO, park+wind+temperature, and finally calibrating
+    with the archetype calibrator (if available) → per-PA isotonic → Poisson fallback.
     """
-    # --- baseline batter HR/PA over 180d (shrunk to league)
+
+    # --- league baseline (HR per PA) ---
+    league_hrpa = max(LEAGUE_BAT.get("HR", 0.025), 1e-6)
+
+    # --- batter baseline HR/PA over 180d (shrunk to league) ---
     end = datetime.today()
     start = (end - timedelta(days=180)).strftime("%Y-%m-%d")
     end_s = end.strftime("%Y-%m-%d")
     sb = fetch_statcast_raw(start, end_s)
-    league_hr = max(LEAGUE_BAT.get("HR", 0.025), 1e-6)
     if sb is None or sb.empty:
-        base_hrpa = league_hr
+        base_hrpa = league_hrpa
     else:
         b = sb[sb["batter"] == batter_pid]
         pa_b = int(b["events"].notna().sum())
         hr_b = int((b["events"] == "home_run").sum())
         prior_pa = 120
-        base_hrpa = ((hr_b + league_hr * prior_pa) / (pa_b + prior_pa)) if (pa_b + prior_pa) > 0 else league_hr
+        base_hrpa = ((hr_b + league_hrpa * prior_pa) / (pa_b + prior_pa)) if (pa_b + prior_pa) > 0 else league_hrpa
 
-    # --- opponent side: SP vs-side HR allowance & bullpen HR/PA
+    # --- opponent SP vs-side allowance; bullpen HR/PA ---
     sp_feats = get_statcast_pitcher_features(opp_starter_pid) or {}
     side = (batter_stand or "R").upper()
     if side.startswith("L"):
         sp_hr = float(sp_feats.get("vs_L_HR_rate", np.nan))
     else:
         sp_hr = float(sp_feats.get("vs_R_HR_rate", np.nan))
-    f_sp = (sp_hr / league_hr) if (np.isfinite(sp_hr) and sp_hr > 0) else 1.0
+    f_sp = (sp_hr / league_hrpa) if (np.isfinite(sp_hr) and sp_hr > 0) else 1.0
 
     bp_hr, _ = team_bullpen_hrpa(opp_team, exclude_pid=opp_starter_pid)
-    f_bp = (bp_hr / league_hr) if bp_hr > 0 else 1.0
+    f_bp = (bp_hr / league_hrpa) if bp_hr > 0 else 1.0
 
     share_sp = sp_pa_share(opp_starter_pid)
     p_pitch = base_hrpa * (share_sp * f_sp + (1.0 - share_sp) * f_bp)
 
-    # --- matchup xISO bump (pitch-mix × batter-by-pitch)
+    # --- batter hot/cold bump (1d/7d) ---
+    p_pitch *= batter_recent_multiplier(get_recent_evt_feats(batter_pid))
+
+    # --- pitcher recent HR/PA allowed bump (30d) ---
+    p_pitch *= pitcher_recent_multiplier(get_pitcher_recent(opp_starter_pid), league_hrpa)
+
+    # --- matchup xISO bump (pitch mix × batter-by-pitch ISO) ---
     try:
-        xiso = expected_matchup_xiso(opp_starter_pid, batter_pid)
-        # elasticity ~ ±30% for roughly ±0.08 ISO around ~.160
-        bump = 1.0 + 0.5 * ((xiso - 0.160) / 0.160)
-        p_pitch *= float(np.clip(bump, 0.7, 1.3))
+        xiso = expected_matchup_xiso(opp_starter_pid, batter_pid)  # 0..~.4+
+        # elasticity ~ ±40% for roughly ±0.08 ISO around ~.160 (clamped)
+        p_pitch *= float(np.clip(1.0 + 0.4 * ((xiso - 0.160) / 0.160), 0.7, 1.3))
     except Exception:
         pass
 
-    # --- park & wind
+    # --- park + wind + temperature ---
     mon = datetime.today().month
     pf = fetch_monthly_park_factors(YEAR) or {}
     pf_hr = (pf.get(opp_team, {}).get(mon, {}).get("HR", 100) / 100.0)
-    wind_mul = 1.0 + float(tail_wind_pct(game_pk or 0))  # 0..~0.3
-    p_adj = p_pitch * pf_hr * wind_mul
 
-    # --- per-game P(HR≥1)
+    wind_mul = 1.0 + float(tail_wind_pct(game_pk or 0))  # 0..~0.3
+    temp_mul = 1.0
+    if game_pk:
+        try:
+            w = get_game_weather(game_pk) or {}
+            temp_mul = _temp_multiplier(w.get("temp_F"))
+        except Exception:
+            pass
+
+    p_adj = p_pitch * pf_hr * wind_mul * temp_mul
+
+    # --- per-game λ and calibration ---
     lam = float(exp_pa) * float(p_adj) * float(HR_LAMBDA_SCALE)
     lam = max(0.0, min(lam, 5.0))
-    if ("HR", 1) in iso_pa_calibrators:
+
+    # prefer archetype calibrator if present; else per-PA iso; else Poisson
+    try:
+        scb = get_statcast_batter_features(batter_pid) or {}
+        arch = infer_hr_archetype(
+            None,
+            scb.get("stand", batter_stand or "R"),
+            get_season_iso(batter_pid),
+            scb.get("pull_pct", None)
+        )
+    except Exception:
+        arch = None
+
+    if arch and ("HR", 1, arch) in hr_game_cals:
+        p_game = float(hr_game_cals[("HR", 1, arch)].predict([lam])[0])
+    elif ("HR", 1) in iso_pa_calibrators:
         p_game = float(iso_pa_calibrators[("HR", 1)].predict([lam])[0])
     else:
         p_game = float(1.0 - np.exp(-lam))
+
     return float(np.clip(p_game, 0.0, 0.999))
 
 # ------------------------ IP regression & sampler ------------------------
@@ -918,6 +1384,47 @@ def build_batter_career_rates(years:list, weights:list=None) -> pd.DataFrame:
         "R_rate":   (g.R   * g.weight).sum()/g.wPA.sum() if g.wPA.sum()>0 else 0,
     })).reset_index()
     return agg
+
+# ------------------------ Season HR splits vs R/L (cached) ------------------------
+@disk_cache("season_hr_splits.pkl")
+def load_season_hr_splits(year: int = YEAR, days_back: int = 365) -> dict[int, dict[str, int]]:
+    """
+    Returns {batter_id: {"HR_vs_R": int, "HR_vs_L": int}} using Statcast (season-to-date by default).
+    Cached to avoid re-pulling each run.
+    """
+    try:
+        end   = datetime.today()
+        start = datetime(year, 3, 1) if days_back <= 0 else (end - timedelta(days=days_back))
+        df    = fetch_statcast_raw(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+        if df is None or df.empty or "events" not in df.columns or "batter" not in df.columns:
+            return {}
+
+        ev = df.copy()
+        ev["events"] = ev["events"].astype(str).str.lower()
+
+        # Make sure we have pitcher handedness
+        if "p_throws" not in ev.columns and "pitcher" in ev.columns:
+            pids = ev["pitcher"].dropna().astype(int).unique().tolist()
+            map_throws = {}
+            for pid in pids:
+                feats = get_statcast_pitcher_features(pid) or {}
+                th = str(feats.get("throws", feats.get("p_throws", "R"))).upper()[:1]
+                map_throws[pid] = th if th in ("R","L") else "R"
+            ev["p_throws"] = ev["pitcher"].map(map_throws).fillna("R")
+
+        if "p_throws" not in ev.columns:
+            return {}
+
+        use = ev.loc[ev["events"].eq("home_run"), ["batter", "p_throws"]].copy()
+        use["p_throws"] = use["p_throws"].astype(str).str.upper().str[0]
+        agg = use.groupby(["batter", "p_throws"]).size().unstack(fill_value=0)
+
+        out = {}
+        for bid, row in agg.iterrows():
+            out[int(bid)] = {"HR_vs_R": int(row.get("R", 0)), "HR_vs_L": int(row.get("L", 0))}
+        return out
+    except Exception:
+        return {}
 
 BATTER_CAREER = build_batter_career_rates([YEAR-3, YEAR-2, YEAR-1, YEAR])
 
@@ -1332,8 +1839,8 @@ __all__ = [
     'predict_hits','predict_hits_interval','features_hit_base','league_hit_means','iso_hit_calibrators',
     'predict_hr_proba','predict_hr_count_pt','predict_hr_hardhit','predict_hr_2swhiff','predict_hr_pullangle',
     'iso_pa_calibrators','expected_matchup_xiso','hr_game_cals','HR_LAMBDA_SCALE','infer_hr_archetype','IP_REG','batter_game_hr_prob',
-    'get_recent_evt_feats','batter_recent_multiplier','get_pitcher_recent','pitcher_recent_multiplier'
-
+    'get_recent_evt_feats','batter_recent_multiplier','get_pitcher_recent','pitcher_recent_multiplier', 'get_season_iso',
+    'load_b14_feats','load_season_hr_splits','load_pitcher_vs_side_hr','load_season_hr_splits', 'build_count_pitchtype_tables','build_hr_count_pt_onehot','build_heart_rate_table',
 ]
 
 def cache_all():
@@ -1347,6 +1854,11 @@ def cache_all():
     logging.info("7) per-PA calibrators"); build_pa_isotonic_calibrators()
     logging.info("8) HR archetype calibrators"); build_hr_game_calibrators()
     logging.info("9) HR λ-scale"); _estimate_hr_lambda_scale()
+    logging.info("10) 14d batter feats");            build_b14_feats(days_window=180, days_recent=14)
+    logging.info("11) season HR splits");            load_season_hr_splits(YEAR)
+    logging.info("12) pitcher vs-side HR (365d)");   build_pitcher_vs_side_hr(days=365)
+    logging.info("13) season HR R/L splits");         load_season_hr_splits()
+
 
 if __name__=="__main__":
     cache_all()
