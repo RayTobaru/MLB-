@@ -67,13 +67,16 @@ Utilize Sportsbook odds to a csv file to create baseline modeling
 <img width="167" height="744" alt="image" src="https://github.com/user-attachments/assets/46a8e5fc-4aad-4e16-b368-c586219d6806" />
 
 Select Today's Matchup
-<img width="1314" height="291" alt="image" src="https://github.com/user-attachments/assets/dde6ee08-855e-4e79-b432-b9167e9f2b7c" />
-
 Simulate and creates 
 Prints starter KO tables & batter props
 Builds pitcher & batter probability profiles
 Loads CSV data (or sample), stubs for ETL 
-<img width="1483" height="447" alt="image" src="https://github.com/user-attachments/assets/192806e6-298c-4797-8fe3-d36b182ecece" />
+<img width="1727" height="696" alt="image" src="https://github.com/user-attachments/assets/d516404e-7bd3-41ed-9b5f-6d6ce51f8055" />
+
+
+
+Creates Shortlist for best EV athletes based on HR odds, book odds and their HR% as well as best HR producing athletes in their upcomming matchups 
+<img width="1105" height="613" alt="image" src="https://github.com/user-attachments/assets/5467c581-37ac-46e0-99ee-b073870ed986" />
 
 
 
